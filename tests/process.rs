@@ -27,9 +27,7 @@ fn after_each() {
 fn captures_log_from_single_thread() {
     let __ = before_each();
 
-    logcap::builder()
-        .scope(CaptureScope::Process)
-        .setup();
+    logcap::builder().scope(CaptureScope::Process).setup();
 
     info!("foobar");
 
@@ -47,9 +45,7 @@ fn captures_log_from_single_thread() {
 fn captures_logs_across_threads() {
     let __ = before_each();
 
-    logcap::builder()
-        .scope(CaptureScope::Process)
-        .setup();
+    logcap::builder().scope(CaptureScope::Process).setup();
 
     info!("main thread");
 
