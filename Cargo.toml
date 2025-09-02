@@ -1,7 +1,12 @@
 [package]
 name = "logcap"
+description = "A library for capturing log output."
 version = "0.1.0"
 edition = "2021"
+keywords = ["log", "capture"]
+homepage = "https://github.com/kormide/logcap"
+repository = "https://github.com/kormide/logcap"
+license-file = "LICENSE"
 
 [dependencies]
 log = "0.4.0"
