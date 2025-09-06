@@ -3,7 +3,7 @@ use std::{
     thread,
 };
 
-use log::{info, Level};
+use log::{debug, info, Level, LevelFilter};
 use logcap::CaptureScope;
 
 extern crate logcap;
@@ -63,6 +63,40 @@ fn captures_logs_across_threads() {
         assert!(logs.iter().find(|log| log.body == "thread a").is_some());
         assert!(logs.iter().find(|log| log.body == "thread b").is_some());
         assert!(logs.iter().find(|log| log.body == "thread c").is_some());
+    });
+
+    after_each();
+}
+
+#[test]
+pub fn overwites_max_log_level_on_subsequent_calls() {
+    let __ = before_each();
+
+    logcap::builder()
+        .scope(CaptureScope::Process)
+        .max_level(LevelFilter::Info)
+        .setup();
+
+    info!("foobar");
+    debug!("moocow");
+
+    logcap::consume(|logs| {
+        assert_eq!(1, logs.len());
+        assert_eq!("foobar", logs[0].body);
+    });
+
+    logcap::builder()
+        .scope(CaptureScope::Process)
+        .max_level(LevelFilter::Debug)
+        .setup();
+
+    info!("foobar");
+    debug!("moocow");
+
+    logcap::consume(|logs| {
+        assert_eq!(2, logs.len());
+        assert_eq!("foobar", logs[0].body);
+        assert_eq!("moocow", logs[1].body);
     });
 
     after_each();

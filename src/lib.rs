@@ -100,15 +100,16 @@
 
 use std::{
     cell::RefCell,
-    sync::{Mutex, OnceLock},
+    sync::{LazyLock, Mutex, OnceLock},
     time::SystemTime,
 };
 
 use log::{Level, LevelFilter, Log};
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
-thread_local! {static THREAD_RECORDS: RefCell<Vec<CapturedLog>> = RefCell::new(Vec::new())}
-static PROCESS_RECORDS: Mutex<Vec<CapturedLog>> = Mutex::new(Vec::new());
+static PROCESS_LOGGER_DATA: LazyLock<Mutex<LoggerData>> =
+    LazyLock::new(|| Mutex::new(LoggerData::new()));
+thread_local! {static THREAD_LOGGER_DATA: RefCell<LoggerData> = RefCell::new(LoggerData::new())}
 
 /// A log captured by calls to the logging macros ([info!](log::info), [warn!](log::warn), etc.).
 #[derive(Debug)]
@@ -139,16 +140,37 @@ pub enum LogOutput {
     Stdout,
 }
 
-#[derive(Debug)]
-struct Logger {
-    scope: CaptureScope,
+/// Properties of the logger. These need to be stored separately from the
+/// logger because they can exist per thread or for the process, while the
+/// logger itself must be static based on the design of the [`log`] facade.
+struct LoggerData {
+    records: Vec<CapturedLog>,
     max_level: LevelFilter,
     output: Option<LogOutput>,
 }
 
+impl LoggerData {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+            max_level: LevelFilter::Trace,
+            output: Some(LogOutput::Stderr),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Logger {
+    scope: CaptureScope,
+}
+
 impl Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= self.max_level
+        match self.scope {
+            CaptureScope::Process => metadata.level() <= log::max_level(),
+            CaptureScope::Thread => THREAD_LOGGER_DATA
+                .with(|logger_data| metadata.level() <= logger_data.borrow().max_level),
+        }
     }
 
     fn log(&self, record: &log::Record) {
@@ -163,16 +185,27 @@ impl Log for Logger {
         };
 
         match self.scope {
-            CaptureScope::Process => PROCESS_RECORDS
+            CaptureScope::Process => PROCESS_LOGGER_DATA
                 .lock()
-                .expect("failed to lock log records")
+                .expect("failed to lock process logger data")
+                .records
                 .push(captured_log),
-            CaptureScope::Thread => THREAD_RECORDS.with(|records| {
-                records.borrow_mut().push(captured_log);
+            CaptureScope::Thread => THREAD_LOGGER_DATA.with(|logger_data| {
+                logger_data.borrow_mut().records.push(captured_log);
             }),
         }
 
-        if let Some(output) = self.output {
+        if let Some(output) = match self.scope {
+            CaptureScope::Process => {
+                PROCESS_LOGGER_DATA
+                    .lock()
+                    .expect("failed to lock process logger data")
+                    .output
+            }
+            CaptureScope::Thread => {
+                THREAD_LOGGER_DATA.with(|logger_data| logger_data.borrow().output)
+            }
+        } {
             match output {
                 LogOutput::Stderr => {
                     eprintln!(
@@ -234,18 +267,13 @@ impl Builder {
     }
 
     pub fn setup(&self) {
-        let logger = Logger {
-            scope: self.scope,
-            max_level: self.max_level,
-            output: self.output,
-        };
+        let logger = Logger { scope: self.scope };
 
         match LOGGER.set(logger) {
             Ok(_) => {
                 log::set_logger(LOGGER.get().unwrap()).expect(
                     "cannot set logcap because another logger has already been initialized",
                 );
-                log::set_max_level(self.max_level);
             }
             Err(_) => {
                 if LOGGER.get().unwrap().scope != self.scope {
@@ -253,6 +281,24 @@ impl Builder {
                 }
             }
         }
+
+        // Reset the max level or set it on a per-thread basis if the logger already exists
+        match self.scope {
+            CaptureScope::Process => {
+                log::set_max_level(self.max_level);
+                let mut logger_data = PROCESS_LOGGER_DATA.lock().unwrap();
+                logger_data.max_level = self.max_level;
+                logger_data.output = self.output;
+            }
+            CaptureScope::Thread => {
+                log::set_max_level(LevelFilter::Trace);
+                THREAD_LOGGER_DATA.set(LoggerData {
+                    records: Vec::new(),
+                    max_level: self.max_level,
+                    output: self.output,
+                });
+            }
+        };
     }
 }
 
@@ -278,16 +324,14 @@ pub fn consume(f: impl FnOnce(Vec<CapturedLog>)) {
     match LOGGER.get() {
         Some(logger) => match logger.scope {
             CaptureScope::Process => {
-                let mut records = PROCESS_RECORDS.lock().unwrap();
                 let mut moved: Vec<CapturedLog> = Vec::new();
-                moved.extend(records.drain(..));
+                moved.extend(PROCESS_LOGGER_DATA.lock().unwrap().records.drain(..));
                 f(moved);
             }
             CaptureScope::Thread => {
-                THREAD_RECORDS.with(|records| {
-                    let mut records = records.borrow_mut();
+                THREAD_LOGGER_DATA.with(|logger_data| {
                     let mut moved: Vec<CapturedLog> = Vec::new();
-                    moved.extend(records.drain(..));
+                    moved.extend(logger_data.borrow_mut().records.drain(..));
                     f(moved);
                 });
             }
@@ -301,13 +345,11 @@ pub fn clear() {
     match LOGGER.get() {
         Some(logger) => match logger.scope {
             CaptureScope::Process => {
-                let mut records = PROCESS_RECORDS.lock().unwrap();
-                records.clear();
+                PROCESS_LOGGER_DATA.lock().unwrap().records.clear();
             }
             CaptureScope::Thread => {
-                THREAD_RECORDS.with(|records| {
-                    let mut records = records.borrow_mut();
-                    records.clear();
+                THREAD_LOGGER_DATA.with(|logger_data| {
+                    logger_data.borrow_mut().records.clear();
                 });
             }
         },
@@ -319,7 +361,7 @@ pub fn clear() {
 mod tests {
     use std::thread;
 
-    use log::{debug, info, warn};
+    use log::{debug, error, info, warn};
 
     use super::*;
 
@@ -438,5 +480,40 @@ mod tests {
         super::consume(|logs| {
             assert!(logs.is_empty());
         })
+    }
+
+    #[test]
+    fn captures_at_specified_level() {
+        super::builder().max_level(LevelFilter::Warn).setup();
+
+        warn!("foobar");
+
+        super::consume(|logs| {
+            assert_eq!(1, logs.len());
+            assert_eq!("foobar", logs[0].body);
+        });
+    }
+
+    #[test]
+    fn captures_below_specified_level() {
+        super::builder().max_level(LevelFilter::Warn).setup();
+
+        error!("foobar");
+
+        super::consume(|logs| {
+            assert_eq!(1, logs.len());
+            assert_eq!("foobar", logs[0].body);
+        });
+    }
+
+    #[test]
+    fn does_not_capture_above_specified_level() {
+        super::builder().max_level(LevelFilter::Info).setup();
+
+        debug!("foobar");
+
+        super::consume(|logs| {
+            assert!(logs.is_empty());
+        });
     }
 }
