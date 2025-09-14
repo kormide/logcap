@@ -5,6 +5,7 @@ A Rust crate for capturing application log output for integration testing.
 The logger can have a _threaded_ scope to capture logs from a thread, or with a _process_ scope to capture across all threads.
 
 See the [documentation](https://docs.rs/logcap/latest/logcap).
+Crate: https://crates.io/crates/logcap.
 
 ## Examples
 
