@@ -1,7 +1,7 @@
 [package]
 name = "logcap"
 description = "A library for capturing log output."
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 keywords = ["log", "capture", "test"]
 categories = ["development-tools::debugging", "development-tools::testing"]
