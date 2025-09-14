@@ -11,8 +11,8 @@ See the [documentation](https://docs.rs/logcap/latest/logcap).
 ### Capture logs within a thread
 
 ```rust
-use logcap::CaptureScope;
-use log::info;
+use log::{info, Level};
+use logcap::assert_logs;
 
 #[test]
 fn test_logs() {
@@ -20,12 +20,15 @@ fn test_logs() {
 
     // test logic outputting logs
     info!("foobar");
+    info!("moocow");
+    info!("hello, world!");
 
     // make assertions on logs
-    logcap::consume(|logs| {
-        assert_eq!(1, logs.len());
-        assert_eq!("foobar", logs[0].body);
-    });
+    assert_logs!(
+        "foobar",
+        "^m.*w$",
+        (Level::Info, "hello, world!")
+    );
 }
 ```
 
@@ -33,8 +36,8 @@ fn test_logs() {
 Run tests with `--test_threads=1` to avoid clobbering logs between tests, or use a mutex for synchronization.
 
 ```rust
-use logcap::CaptureScope;
 use log::{LevelFilter,warn};
+use logcap::{assert_logs, CaptureScope};
 
 #[test]
 fn test_logs() {
