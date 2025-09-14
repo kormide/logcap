@@ -1,5 +1,5 @@
 //! # Overview
-//! This crate contains a [`log::Log`] implementation that captures logs from the logging
+//! This crate contains a [`log::Log`] implementation that captures logs created by the logging
 //! macros [`info!`](log::info!), [`warn!`](log::warn!), etc.
 //! Similar to [testing_logger](https://docs.rs/testing_logger/latest/testing_logger), it is useful for making assertions about
 //! log output, but adds the ability to capture logs of multithreaded applications.
@@ -16,8 +16,8 @@
 //!
 //! Setup the logger in each test. If it has already been setup, it will be a no-op:
 //! ```
-//! use logcap::CaptureScope;
 //! use log::{info,LevelFilter};
+//! use logcap::{assert_logs, CaptureScope};
 //!
 //! #[test]
 //! fn test_logs() {
@@ -28,12 +28,15 @@
 //!
 //!     // test logic outputting logs
 //!     info!("foobar");
+//!     info!("moocow");
+//!     info!("hello, world!");
 //!
 //!     // make assertions on logs
-//!     logcap::consume(|logs| {
-//!         assert_eq!(1, logs.len());
-//!         assert_eq!("foobar", logs[0].body);
-//!     });
+//!     assert_logs!(
+//!         "foobar",
+//!         "^m.*w$",
+//!         (Level::Info, "hello, world!")
+//!     );
 //! }
 //! ```
 //!
@@ -51,8 +54,8 @@
 //!
 //! Run tests with `--test_threads=1` to avoid clobbering logs between tests.
 //! ```
-//! use logcap::CaptureScope;
 //! use log::{LevelFilter,warn};
+//! use logcap::CaptureScope;
 //!
 //! #[test]
 //! fn test_logs() {
@@ -78,7 +81,11 @@
 //! ```
 //!
 //! ## Processing logs
-//! Call [`consume`] to process the captured logs and run assertions. The logs will be cleared after the closure runs.
+//!
+//! Use the [`assert_logs!`] macro to assert a sequence of logs using an expressive format.
+//!
+//! Call [`consume`] or [`examine`] to process the captured logs and run assertions over the full
+//! collection of logs.
 //!
 //! Call [`clear`] to remove existing logs without processing them.
 //!
@@ -105,6 +112,7 @@ use std::{
 };
 
 use log::{Level, LevelFilter, Log};
+use regex::Regex;
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 static PROCESS_LOGGER_DATA: LazyLock<Mutex<LoggerData>> =
@@ -318,7 +326,7 @@ pub fn setup() {
 }
 
 /// Consume captured logs and perform and processing or assertions.
-/// Threaded capture will capture logs in order. Logging between threads
+/// Threaded capture will capture logs in order. Logging between threads is
 /// synchronized and captured first come, first serve.
 pub fn consume(f: impl FnOnce(Vec<CapturedLog>)) {
     match LOGGER.get() {
@@ -333,6 +341,25 @@ pub fn consume(f: impl FnOnce(Vec<CapturedLog>)) {
                     let mut moved: Vec<CapturedLog> = Vec::new();
                     moved.extend(logger_data.borrow_mut().records.drain(..));
                     f(moved);
+                });
+            }
+        },
+        None => panic!("logcap has not been initialized"),
+    }
+}
+
+/// Examine captured logs and perform and processing or assertions.
+/// Threaded capture will capture logs in order. Logging between threads is
+/// synchronized and captured first come, first serve.
+pub fn examine(f: impl FnOnce(&Vec<CapturedLog>)) {
+    match LOGGER.get() {
+        Some(logger) => match logger.scope {
+            CaptureScope::Process => {
+                f(&PROCESS_LOGGER_DATA.lock().unwrap().records);
+            }
+            CaptureScope::Thread => {
+                THREAD_LOGGER_DATA.with(|logger_data| {
+                    f(&logger_data.borrow_mut().records);
                 });
             }
         },
@@ -355,6 +382,129 @@ pub fn clear() {
         },
         None => panic!("logcap has not been initialized"),
     }
+}
+
+/// A pattern to match against captured logs.
+#[derive(Debug)]
+pub struct LogPattern {
+    /// The log [`Level`](`log::Level`) to match against, or `None` to disregard
+    pub level: Option<Level>,
+    /// A regular expression to match against the log body.
+    pub body: Regex,
+    /// The log target to match against, or `None` to disregard
+    pub target: Option<String>,
+}
+
+impl LogPattern {
+    pub fn matches(&self, log: &CapturedLog) -> bool {
+        self.body.is_match(&log.body)
+            && self.level.as_ref().is_none_or(|level| *level == log.level)
+            && self
+                .target
+                .as_ref()
+                .is_none_or(|target| *target == log.target)
+    }
+}
+
+impl From<&str> for LogPattern {
+    fn from(value: &str) -> Self {
+        Self {
+            body: Regex::new(value).expect("bad regex"),
+            level: None,
+            target: None,
+        }
+    }
+}
+
+impl From<(Level, &str)> for LogPattern {
+    fn from(value: (Level, &str)) -> Self {
+        Self {
+            body: Regex::new(value.1).expect("bad regex"),
+            level: Some(value.0),
+            target: None,
+        }
+    }
+}
+
+impl From<(&str, &str)> for LogPattern {
+    fn from(value: (&str, &str)) -> Self {
+        Self {
+            body: Regex::new(value.1).expect("bad regex"),
+            level: None,
+            target: Some(String::from(value.0)),
+        }
+    }
+}
+
+impl From<(Level, &str, &str)> for LogPattern {
+    fn from(value: (Level, &str, &str)) -> Self {
+        Self {
+            body: Regex::new(value.2).expect("bad regex"),
+            level: Some(value.0),
+            target: Some(String::from(value.1)),
+        }
+    }
+}
+
+/// Assert a sequence of matching log patterns over captured logs.
+///
+/// In the simplest form, log patterns can be specified using string slices which
+/// get converted into [`Regex`](regex::Regex)s and match against the log body.
+/// Finer-grained assertions can be made with tuples containing additional metadata
+/// to match. See the snippet below for all of the possible variants.
+///
+/// The sequence of patterns need not be exhaustive—they can describe a subset of the
+/// captured logs but the ordering must be correct.
+///
+/// The macro panics if any of the log patterns fail to match, or if they fail to match in the
+/// given order.
+///
+/// ```
+/// use log::{info, Level};
+/// use logcap::{assert_logs};
+///
+/// logcap::setup();
+///
+/// for i in 0..5 {
+///     info!(target: "target", "foobar");
+/// }
+///
+/// assert_logs!(
+///     // body as regex (implicit)
+///     "foobar",
+///     // body as regex (explicit)
+///     "^foobar$",
+///     // level and body
+///     (Level::Info, "foobar"),
+///     // target and body
+///     ("target", "^foobar$"),
+///     // level, target, and body
+///     (Level::Info, "target", "foobar")
+/// );
+/// ```
+#[macro_export]
+macro_rules! assert_logs {
+    ( $( $x:expr ),* ) => {
+        {
+            let mut patterns: Vec<$crate::LogPattern> = Vec::new();
+            $(
+                patterns.push($x.into());
+            )*
+
+            $crate::examine(|logs| {
+                let mut i = 0;
+                'outer: for pattern in patterns {
+                    while i < logs.len() {
+                        if pattern.matches(&logs[i]) {
+                            continue 'outer;
+                        }
+                        i += 1;
+                    }
+                    panic!("failed to match log pattern {:?}", pattern);
+                }
+            });
+        }
+    };
 }
 
 #[cfg(test)]
@@ -463,6 +613,23 @@ mod tests {
     }
 
     #[test]
+    fn examine_logs_does_not_consume() {
+        super::setup();
+
+        info!("foo");
+
+        super::examine(|logs| {
+            assert_eq!(1, logs.len());
+            assert_eq!("foo", logs[0].body);
+        });
+
+        super::examine(|logs| {
+            assert_eq!(1, logs.len());
+            assert_eq!("foo", logs[0].body);
+        });
+    }
+
+    #[test]
     fn consume_empty_logs() {
         super::setup();
 
@@ -515,5 +682,111 @@ mod tests {
         super::consume(|logs| {
             assert!(logs.is_empty());
         });
+    }
+
+    #[test]
+    fn assert_logs_single_log() {
+        super::setup();
+
+        info!("foobar");
+
+        assert_logs!("foobar");
+    }
+
+    #[test]
+    fn assert_logs_mulitple_logs() {
+        super::setup();
+
+        info!("foobar");
+        info!("abc");
+        info!("moocow");
+        info!("hello world");
+        info!("Stop. Who would cross the Bridge of Death must answer me these questions three, ere the other side he see");
+
+        assert_logs!(
+            "foobar",
+            "abc",
+            "moocow",
+            "hello world",
+            "Stop. Who would cross the Bridge of Death must answer me these questions three, ere the other side he see"
+        );
+    }
+
+    #[test]
+    fn assert_logs_non_exhaustive_match() {
+        super::setup();
+
+        info!("foobar");
+        info!("abc");
+        info!("moocow");
+        info!("hello world");
+        info!("Stop. Who would cross the Bridge of Death must answer me these questions three, ere the other side he see");
+
+        assert_logs!("foobar", "moocow", "hello world");
+    }
+
+    #[test]
+    fn assert_logs_does_not_consume() {
+        super::setup();
+
+        info!("foobar");
+
+        assert_logs!("foobar");
+        assert_logs!("foobar");
+    }
+
+    #[test]
+    #[should_panic]
+    fn assert_logs_panics_on_no_match() {
+        super::setup();
+
+        info!("foobar");
+
+        assert_logs!("moocow");
+    }
+
+    #[test]
+    #[should_panic]
+    fn assert_logs_panics_on_wrong_order() {
+        super::setup();
+
+        info!("foobar");
+        info!("moocow");
+
+        assert_logs!("moocow", "foobar");
+    }
+
+    #[test]
+    fn assert_logs_regex_matching() {
+        super::setup();
+
+        info!("foobar");
+        info!("moocow");
+        info!("Stop. Who would cross the Bridge of Death must answer me these questions three, ere the other side he see");
+
+        assert_logs!("^foobar$", "ooco", r".*?Bridge.*?he\s");
+    }
+
+    #[test]
+    fn assert_logs_input_variants() {
+        super::setup();
+
+        info!("foobar");
+        warn!("abc");
+        error!(target: "farm", "moocow");
+        debug!(target: "programmers", "hello world");
+        info!("Stop. Who would cross the Bridge of Death must answer me these questions three, ere the other side he see");
+
+        assert_logs!(
+            "^foo",
+            (Level::Warn, "abc"),
+            ("farm", "moocow"),
+            (Level::Debug, "programmers", "hello world"),
+            LogPattern {
+                level: None,
+                body: Regex::new(r".*?Bridge.*?he\s").expect("bad regex"),
+                target: None
+            }
+        );
     }
 }
