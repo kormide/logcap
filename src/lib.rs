@@ -416,6 +416,16 @@ impl From<&str> for LogPattern {
     }
 }
 
+impl From<&String> for LogPattern {
+    fn from(value: &String) -> Self {
+        Self {
+            body: Regex::new(value).expect("bad regex"),
+            level: None,
+            target: None,
+        }
+    }
+}
+
 impl From<(Level, &str)> for LogPattern {
     fn from(value: (Level, &str)) -> Self {
         Self {
@@ -706,7 +716,7 @@ mod tests {
         assert_logs!(
             "foobar",
             "abc",
-            "moocow",
+            &format!("{}cow", "moo"),
             "hello world",
             "Stop. Who would cross the Bridge of Death must answer me these questions three, ere the other side he see"
         );
